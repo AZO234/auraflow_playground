@@ -9,7 +9,7 @@ ComfyUI playground 側に残った機能だけを保持している。
     定数:   PROMPT_TOML / LORA_PARAM_TOML
     TOML:   load_prompt_config / load_lora_params
     プロンプト: normalize_emphasis / build_prompt / EMPHASIS_RE 系
-    LoRA 抽選: build_lora_corpus / pick_lora_by_keywords / pick_n_loras_by_keywords
+    LoRA 抽選: pick_n_loras_random (キーワードマッチは廃止、一様ランダム)
     解析:   classify_tensor / detect_base_arch / detect_vae_arch / lora_target_arch /
             detect_controlnet_arch / detect_embedding_arch / extract_lora_trigger_hints
             (系統は "auraflow" / "flux1" / "flux2" / "sdxl" / "sd15" / "unknown" を返す。
@@ -142,9 +142,9 @@ def build_prompt(cfg: dict, pony: bool = False) -> tuple[str, str, list[str], bo
       lighting    : 均等抽選 1 つ → "with {lighting}"。
       *_always    : 末尾 / negative 本体。
 
-    最後の kw 要素は当該エントリが採用されたときに LoRA 名マッチング用キーワードとして
-    収集される (`pick_lora_by_keywords` で使用)。最終的に normalize_emphasis で
-    `**word**` を compel 重み記法に変換して返す。
+    返り値の lora_keywords スロットは廃止済みで常に空 (LoRA はランダム選択に統一)。
+    prompt.toml の kw 列はパースされるが無視される (旧フォーマット互換のため残す)。
+    最終的に normalize_emphasis で `**word**` を compel 重み記法に変換して返す。
     """
     parts: list[str] = []
     lora_keywords: list[str] = []
@@ -299,25 +299,16 @@ def build_prompt(cfg: dict, pony: bool = False) -> tuple[str, str, list[str], bo
         if pony_prefix:
             parts.insert(0, pony_prefix)
 
-    # LoRA キーワード重複排除: 各 entry をカンマ区切りで atomic に分解、
-    # 大小文字無視で初出順を保つ。複数 entry に同じ kw (例: "nude") が混じっても 1 回のみ。
-    seen_kws: set[str] = set()
-    deduped_kws: list[str] = []
-    for kw_entry in lora_keywords:
-        for atom in str(kw_entry).split(","):
-            atom = atom.strip()
-            if not atom:
-                continue
-            key = atom.lower()
-            if key in seen_kws:
-                continue
-            seen_kws.add(key)
-            deduped_kws.append(atom)
+    # LoRA キーワード機構は廃止 (AuraFlow/Pony はキャラ人相 LoRA が主流で、
+    # 小物・効果のキーワードマッチング前提が成立しないため)。LoRA はランダム選択に統一。
+    # prompt.toml の kw 列はパース時に無視され (上の lora_keywords は使われない)、
+    # 戻り値の keyword スロットは常に空。後方互換のためタプル arity は維持。
+    _ = lora_keywords  # 収集はするが破棄 (toml 旧フォーマット互換のためパースは残す)
 
     return (
         normalize_emphasis(", ".join(parts)),
         normalize_emphasis(neg_always),
-        deduped_kws,
+        [],
         many,
     )
 
@@ -333,154 +324,30 @@ def load_lora_params() -> dict[str, dict]:
         return tomllib.load(f) or {}
 
 
-def build_lora_corpus(loras: list[Path], lora_params: dict) -> dict[str, str]:
-    """各 LoRA の検索用 lowercase 文字列を `{stem: corpus}` で返す。`pick_lora_by_keywords` が参照。
-
-    マッチ対象は 3 つの情報源を結合したテキスト:
-      1. **LoRA のファイル名** (stem)
-      2. **プリセットキーワード**: `extract_lora_trigger_hints` で safetensors メタから抽出した
-         activation_text / trigger_words / ss_tag_frequency 上位タグ
-      3. **LoRA_param.toml の trigger**: ユーザが設定した手動 trigger 文字列
-
-    起動時に 1 回作って LoRA 数ぶん回しても 200 件で 1〜2 秒程度 (メタ読みのみ)。
-    """
-    corpus: dict[str, str] = {}
-    for lora in loras:
-        stem = lora.stem
-        try:
-            hints = extract_lora_trigger_hints(lora)
-        except Exception:
-            hints = []
-        trigger = str((lora_params.get(stem) or {}).get("trigger") or "")
-        parts = [stem, *hints, trigger]
-        corpus[stem] = " ".join(p for p in parts if p).lower()
-    return corpus
-
-
-def _parse_keyword_clauses(keywords: list[str]) -> list[list[str]]:
-    """keyword 文字列群を AND/OR の入れ子に展開する:
-      - `,` で分割 → OR の clause リスト
-      - 各 clause を空白で分割 → AND の token リスト
-      - 全 lowercase 化、空文字は除外
-
-    例: ['naked, nude', 'swimsuit beach', 'wet']
-        → [['naked'], ['nude'], ['swimsuit', 'beach'], ['wet']]
-           (naked OR nude OR (swimsuit AND beach) OR wet の意)
-    """
-    clauses: list[list[str]] = []
-    for kw in keywords:
-        for clause_str in str(kw).split(","):
-            tokens = [t.strip().lower() for t in clause_str.split() if t.strip()]
-            if tokens:
-                clauses.append(tokens)
-    return clauses
-
-
-def _text_matches_clauses(text: str, clauses: list[list[str]]) -> bool:
-    """text を OR of ANDs で判定 (各 clause 内は AND、clause 間は OR)。
-    text は事前に lowercase 化済み前提 (本関数では追加変換しない)。
-    """
-    for clause in clauses:
-        if all(token in text for token in clause):
-            return True
-    return False
-
-
-def pick_lora_by_keywords(compat_loras: list[Path], keywords: list[str],
-                          corpus: dict[str, str] | None = None) -> Optional[Path]:
-    """compat_loras から keywords にマッチする LoRA を抽選する。
-
-    **keyword 構文** (大小文字を問わない):
-      - `,` 区切り = **OR** (どれかの clause がマッチすれば該当)
-      - 空白区切り = **AND** (clause 内の全 token が含まれる必要あり)
-      - 例: `"naked oiled, bondage"` → (naked AND oiled) OR bondage
-
-    - 各 LoRA について `corpus[stem]` (build_lora_corpus 製、stem + preset hints + trigger) を
-      lowercase で部分一致検査 (corpus 未指定なら stem 単独で検査、後方互換)。
-    - match があれば **97% で match 候補から random.choice**、3% で全 compat_loras から random.choice
-      (= 従来抽選にフォールバック、用語に縛られない多様性確保)。
-    - match が無ければ 100% 全 compat_loras から random.choice (= 従来抽選と同義)。
-    - 呼び出し側で `args.lora_prob` ゲートを通す前提。compat_loras が空なら None。
-    """
-    if not compat_loras:
-        return None
-    clauses = _parse_keyword_clauses(keywords)
-    if clauses:
-        matches = []
-        for lora in compat_loras:
-            text = (corpus.get(lora.stem) if corpus is not None else None) or lora.stem.lower()
-            if _text_matches_clauses(text, clauses):
-                matches.append(lora)
-        if matches and random.random() < 0.97:
-            return random.choice(matches)
-    return random.choice(compat_loras)
-
-
-def pick_n_loras_by_keywords(
+def pick_n_loras_random(
     compat_loras: list[Path],
-    keywords: list[str],
-    corpus: dict[str, str] | None = None,
     n_max: int = 3,
     n_min: int = 1,
 ) -> list[Path]:
-    """n_min〜n_max 個のユニークな LoRA を重ね掛け用に抽選する (n は random.randint で決まる)。
+    """compat_loras から n_min〜n_max 個のユニークな LoRA を一様ランダムに抽選する。
 
-    **1 pick = 1 キーワード** の原則。キーワード列をシャッフルして先頭から消費し、各 pick で
-    `pick_lora_by_keywords` を **その 1 キーワードだけ** で呼ぶ。これによって 1 回の生成内で
-    同じキーワードが 2 回以上 LoRA 抽選に使われない (大小文字無視で dedup 済み)。
-
-    - keywords が空 → 全 LoRA から random.choice で n_target 個
-    - keywords が n_target 未満 → 全 kw を使い切り、実 n はその数に縮む
-    - 各 pick で `pick_lora_by_keywords` の 97% match / 3% random フォールバックは生きる
-    - 既に選ばれた LoRA は次の pick の候補から除外、同じ LoRA は重複しない
-
-    呼び出し側は: ① n=1 なら従来通り 1 LoRA を fuse、② n>1 なら set_adapters で複数を adapter
-    として読み、scales = [args.lora_scale / n] * n で重ね掛けする想定。
+    キーワードマッチングは廃止 (AuraFlow/Pony はキャラ人相 LoRA が主流で、
+    小物・効果のキーワード前提が成立しないため)。n は random.randint(n_min, n_max)。
+    呼び出し側は scales = [lora_scale / n] * n 等で重ね掛けする想定。
     """
     if not compat_loras:
         return []
-    # n_min/n_max を [1, len(compat_loras)] にクランプ + n_min <= n_max を保証
     hi = max(1, min(n_max, len(compat_loras)))
     lo = max(1, min(n_min, hi))
     n_target = random.randint(lo, hi)
 
-    # キーワードを大小無視で dedup + シャッフル (build_prompt 側で既に dedup 済みでも安全側に再実行)
-    seen: set[str] = set()
-    unique_kws: list[str] = []
-    for kw in (keywords or []):
-        atom = str(kw).strip()
-        if not atom:
-            continue
-        key = atom.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_kws.append(atom)
-    random.shuffle(unique_kws)
-
     picked: list[Path] = []
     picked_stems: set[str] = set()
-
-    if not unique_kws:
-        # キーワード無し: 純ランダム pick を n_target 回
-        for _ in range(n_target):
-            candidates = [l for l in compat_loras if l.stem not in picked_stems]
-            if not candidates:
-                break
-            chosen = random.choice(candidates)
-            picked.append(chosen)
-            picked_stems.add(chosen.stem)
-        return picked
-
-    # 1 pick = 1 kw 消費、kw が尽きたら停止 (実 n は min(n_target, len(unique_kws)))
-    n_actual = min(n_target, len(unique_kws))
-    for i in range(n_actual):
+    for _ in range(n_target):
         candidates = [l for l in compat_loras if l.stem not in picked_stems]
         if not candidates:
             break
-        chosen = pick_lora_by_keywords(candidates, [unique_kws[i]], corpus)
-        if chosen is None:
-            break
+        chosen = random.choice(candidates)
         picked.append(chosen)
         picked_stems.add(chosen.stem)
     return picked
@@ -547,7 +414,10 @@ def extract_lora_trigger_hints(lora_path: Path) -> list[str]:
 #   BFL/Comfy : "...double_blocks.0..."  /  "...single_blocks.0..."
 #   kohya LoRA: "lora_unet_double_blocks_0_..."  (アンダースコア区切り)
 #   diffusers : "...transformer_blocks..."  /  "...single_transformer_blocks..."
-_FLUX_DIT_MARKERS = ("double_blocks", "single_blocks", "transformer_blocks")
+# Flux 固有の DiT ブロック名。native は double_blocks/single_blocks、diffusers Flux は
+# single_transformer_blocks。汎用名 "transformer_blocks" は SDXL UNet
+# (output_blocks.*.transformer_blocks) も持つため除外 (SDXL を flux1 と誤検出する)。
+_FLUX_DIT_MARKERS = ("double_blocks", "single_blocks", "single_transformer_blocks")
 # flux.1 dev/schnell の隠れ次元 (img_in / x_embedder の出力)。F2 構造判定の基準。
 _FLUX1_HIDDEN = 3072
 # text encoder hidden dims (Embedding 判別用)。4096 = T5-XXL (Flux)。

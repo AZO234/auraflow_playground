@@ -52,8 +52,7 @@ except (AttributeError, OSError):
 from common import (
     build_prompt,
     load_prompt_config,
-    build_lora_corpus,
-    pick_n_loras_by_keywords,
+    pick_n_loras_random,
     current_gpu_temp,
     L,
 )
@@ -73,12 +72,18 @@ CONTROLNET_DIR   = ROOT / "3_3_AuraFlow_ControlNet"
 VAE_DIR          = ROOT / "3_4_AuraFlow_VAE"          # AuraFlow VAE (--vae で明示使用)
 EMBEDDING_DIR    = ROOT / "3_5_AuraFlow_Embedding"
 PROMPTS_DIR      = ROOT / "1_0_prompts"
+# 分離ローダー (transformer 単体 ckpt) の外部 CLIP/VAE 置き場 + 既定ファイル名。
+# all-in-one ckpt は内蔵 CLIP/VAE を優先し、これらは使わない。
+TEXT_ENCODERS_DIR = ROOT / "ComfyUI" / "models" / "text_encoders"
+COMFY_VAE_DIR     = ROOT / "ComfyUI" / "models" / "vae"
+ETC_DIR           = ROOT / "etc"
+DEFAULT_SEPARATE_CLIP = "pile_t5xl_fp16.safetensors"  # 分離経路の既定 CLIP (pile-T5-XL)
+DEFAULT_SEPARATE_VAE  = "sdxl_vae.safetensors"        # 分離経路の既定 VAE (SDXL系 4ch)
 # 出力 dir
 GENERATED_DIR    = ROOT / "3_8_AuraFlow_generated"
 UPSCALED_DIR     = ROOT / "3_9_AuraFlow_upscaled"
 WORKFLOW_DUMP_DIR = ROOT / "workflow_dump"   # --dump-workflow: 組んだ API workflow JSON の出力先
 CHECKPOINT_TOML  = ROOT / "checkpoint.toml"
-LORA_KEYWORDS_TOML = ROOT / "LoRA_keywords.toml"
 AURAFLOW_LORA_HINT_TOML = ROOT / "AuraFlow_LoRA_hint.toml"   # AuraFlow LoRA の subject (pose のみ機能的)
 
 # checkpoint.toml の `style` → 使う Real-ESRGAN モデル
@@ -905,21 +910,8 @@ def reload_update_save_checkpoint_toml(name: str, elapsed_s: float, data: dict) 
 
 
 # --------------------------------------------------------------------------- #
-# LoRA_keywords.toml 管理
+# AuraFlow LoRA subject 管理
 # --------------------------------------------------------------------------- #
-def load_lora_keywords_toml() -> dict:
-    """LoRA_keywords.toml をロード。無ければ空 dict。
-    形式: {stem: {keyword: "..."}}
-    """
-    if not LORA_KEYWORDS_TOML.exists():
-        return {}
-    try:
-        return tomllib.loads(LORA_KEYWORDS_TOML.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(L(f"[警告] LoRA_keywords.toml パース失敗 ({e})、空として扱う", f"[warn] LoRA_keywords.toml parse failed ({e}), treating as empty"), flush=True)
-        return {}
-
-
 def load_auraflow_lora_subjects() -> dict[str, str]:
     """AuraFlow_LoRA_hint.toml から {stem: subject(lower)} を返す。subject="pose" のみ機能的
     (OpenPose 段で除外)。無ければ空 dict。"""
@@ -931,17 +923,6 @@ def load_auraflow_lora_subjects() -> dict[str, str]:
         print(L(f"[警告] AuraFlow_LoRA_hint.toml パース失敗 ({e})、空として扱う", f"[warn] AuraFlow_LoRA_hint.toml parse failed ({e}), treating as empty"), flush=True)
         return {}
     return {stem: str((v or {}).get("subject") or "").strip().lower() for stem, v in data.items()}
-
-
-def build_lora_corpus_for_playground(loras: list[Path], lora_keywords_data: dict) -> dict[str, str]:
-    """common.build_lora_corpus への薄いアダプタ。
-    LoRA_keywords.toml の `keyword` フィールドを common 側の `trigger` 相当として渡す。
-    """
-    adapter = {
-        stem: {"trigger": str((entry or {}).get("keyword") or "")}
-        for stem, entry in lora_keywords_data.items()
-    }
-    return build_lora_corpus(loras, adapter)
 
 
 # --------------------------------------------------------------------------- #
@@ -1182,6 +1163,31 @@ def resolve_vae(name: Optional[str]) -> Optional[str]:
     return None
 
 
+def _find_model_file(name: str, dirs: tuple[Path, ...]) -> Optional[str]:
+    """name (.safetensors 省略可) を dirs から順に探し、見つかればファイル名を返す。"""
+    for d in dirs:
+        cand = d / name
+        if cand.exists():
+            return cand.name
+        if not name.endswith(".safetensors"):
+            cand = d / f"{name}.safetensors"
+            if cand.exists():
+                return cand.name
+    return None
+
+
+def resolve_separate_clip(name: Optional[str]) -> Optional[str]:
+    """分離ローダーの CLIP (pile-T5) を解決。明示名 or 既定 pile_t5xl_fp16 を
+    text_encoders / etc から探す。見つかればファイル名、無ければ None。"""
+    return _find_model_file(name or DEFAULT_SEPARATE_CLIP, (TEXT_ENCODERS_DIR, ETC_DIR))
+
+
+def resolve_separate_vae(name: Optional[str]) -> Optional[str]:
+    """分離ローダーの VAE (SDXL系 4ch) を解決。明示名 or 既定 sdxl_vae を
+    3_4_AuraFlow_VAE / etc / ComfyUI vae から探す。見つかればファイル名、無ければ None。"""
+    return _find_model_file(name or DEFAULT_SEPARATE_VAE, (VAE_DIR, ETC_DIR, COMFY_VAE_DIR))
+
+
 def checkpoint_is_unet_only(path: Path) -> bool:
     """safetensors ヘッダを生読みし、transformer 単体 (model.* のみで vae./text_encoders. を
     含まない) なら True。all-in-one は vae.* / text_encoders.* を持つので False。
@@ -1415,48 +1421,22 @@ def _weighted_pick_scored(scored: list[Path], data: dict) -> Path:
 
 
 # --------------------------------------------------------------------------- #
-# プロンプト後処理: LoRA キーワードを (0.8/N) 重み付けで positive に append
+# プロンプト後処理: pose-gate (OpenPose と pose LoRA の競合回避)
 # --------------------------------------------------------------------------- #
-def augment_positive_with_lora_keywords(positive: str, lora_keywords: list[str],
-                                          total_weight: float = 0.8) -> str:
-    """LoRA キーワード列を atomic (`,` 区切り) に分解し、各々に `total_weight/N` の重みで
-    `(kw:weight), ...` 形式で positive 末尾に連結する。
-
-    例: positive = "a girl, vivid color"
-        lora_keywords = ["nude, naked", "jewel"]
-        → atoms = ["nude", "naked", "jewel"] (N=3、weight=0.27)
-        → "a girl, vivid color, (nude:0.27), (naked:0.27), (jewel:0.27)"
-    """
-    atoms: list[str] = []
-    for entry in (lora_keywords or []):
-        for atom in str(entry).split(","):
-            atom = atom.strip()
-            if atom:
-                atoms.append(atom)
-    if not atoms:
-        return positive
-    w = total_weight / len(atoms)
-    appended = ", ".join(f"({a}:{w:.2f})" for a in atoms)
-    if positive:
-        return f"{positive}, {appended}"
-    return appended
-
-
 def prepare_workflow_prompt(
     positive: str,
     negative: str,
     *,
-    lora_keywords: Optional[list[str]] = None,
     picked_loras: Optional[list[tuple[Path, float]]] = None,
     controlnet_mode: str = "",
     auraflow_lora_subjects: Optional[dict[str, str]] = None,
-    lora_total: float = 0.8,
 ) -> tuple[str, str, list[tuple[Path, float]], list[str]]:
-    """positive/negative を CLI と同じ手順で拡張し、(positive_aug, negative_aug, loras_filtered, logs) を返す。
+    """positive/negative を CLI と同じ手順で整え、(positive, negative, loras_filtered, logs) を返す。
 
-    処理内容: pose-gate (OpenPose と pose LoRA の競合回避) / LoRA キーワード末尾 append。
+    処理内容: pose-gate (OpenPose と pose LoRA の競合回避)。
+    LoRA キーワードによる prompt augmentation は廃止 (LoRA はランダム選択に統一)。
     AuraFlow は通常 CFG で negative が実効なので negative はそのまま CLIPTextEncode に渡す。
-    GUI と CLI の両方からこの 1 関数を通すことでプロンプト augmentation が常に一致する。
+    GUI と CLI の両方からこの 1 関数を通すことでプロンプト処理が常に一致する。
     logs は caller 側で print する想定 (空なら何も出さない)。
     """
     logs: list[str] = []
@@ -1471,13 +1451,7 @@ def prepare_workflow_prompt(
             logs.append(L(f"  [pose-gate] OpenPose 有効 → pose LoRA 除外: {', '.join(dropped)}",
                           f"  [pose-gate] OpenPose active → dropping pose LoRAs: {', '.join(dropped)}"))
 
-    # LoRA キーワード末尾 append (重み付き)
-    positive_augmented = augment_positive_with_lora_keywords(
-        positive, lora_keywords or [], total_weight=lora_total)
-    if positive_augmented != positive:
-        logs.append(f"  prompt+kw : ...{positive_augmented[len(positive):][:80]}")
-
-    return positive_augmented, negative, loras, logs
+    return positive, negative, loras, logs
 
 
 # --------------------------------------------------------------------------- #
@@ -1495,7 +1469,7 @@ def get_prompt_for_iteration(
     extras dict: {model: str, loras: list[(name,strength)]} など、original モードの上書き情報。
 
     - auto    : prompt.toml から build_prompt
-    - sentence: --sentence の文章 + --lora-keywords をそのまま使用、negative は prompt.toml の negative_always
+    - sentence: --sentence の文章をそのまま使用、negative は prompt.toml の negative_always
     - png     : PNG の A1111 'parameters' chunk から positive/negative/lora_keywords を読出
     - original: PNG メタ全部 (Model / Loras / positive / negative / lora_keywords) を流用
     """
@@ -1593,7 +1567,6 @@ def save_with_a1111_metadata(
     width: int,
     height: int,
     checkpoint: str,
-    lora_keywords: list[str],
     loras: Optional[list[tuple[str, float]]] = None,
     controlnet_name: Optional[str] = None,
     controlnet_mode: str = "",
@@ -1623,8 +1596,6 @@ def save_with_a1111_metadata(
     if loras:
         # "Loras" フィールド: A1111 流の "name1: 0.40, name2: 0.40" 列挙
         parsed["params"]["Loras"] = ", ".join(f"{n}: {s:.2f}" for n, s in loras)
-    if lora_keywords:
-        parsed["params"]["Lora keywords"] = ", ".join(lora_keywords)
     if controlnet_name:
         parsed["params"]["ControlNet"] = f"{controlnet_name} (mode={controlnet_mode}, strength={controlnet_strength:.2f})"
     if pose_source:
@@ -1660,9 +1631,6 @@ def main() -> None:
     ap.add_argument("--sentence", type=str, default=None,
                     help=L("--prompt sentence のとき、文章プロンプト。`**word**` 強調記法 OK",
                            "sentence prompt for --prompt sentence. `**word**` emphasis syntax supported"))
-    ap.add_argument("--lora-keywords", type=str, default=None,
-                    help=L("--prompt sentence のとき、LoRA キーワード列 (カンマ区切り)",
-                           "LoRA keyword list for --prompt sentence (comma-separated)"))
     ap.add_argument("--png", type=str, default=None,
                     help=L("画質アップ refine 用 PNG (1_0_prompts/ 配下 or 絶対パス)。"
                            "その画像を AuraFlow img2img で描き直す (1 枚で終了)",
@@ -1784,17 +1752,19 @@ def main() -> None:
                     help=L("ADetailer 各 detected region のステップ数 (既定 30)",
                            "ADetailer inference steps per detected region (default 30)"))
     ap.add_argument("--vae", type=str, default=None,
-                    help=L("外部 VAE を VAELoader で明示使用 (NAME or NAME.safetensors)。3_4_AuraFlow_VAE か "
+                    help=L("外部 VAE を VAELoader で明示使用 (NAME or NAME.safetensors)。3_4_AuraFlow_VAE / etc / "
                            "ComfyUI/models/vae から解決。all-in-one は未指定で同梱 VAE。"
-                           "transformer 単体 checkpoint (分離経路) では SDXL系 VAE が必須",
+                           f"transformer 単体 (分離経路) は未指定なら既定 {DEFAULT_SEPARATE_VAE} を自動使用",
                            "use an external VAE via VAELoader (NAME or NAME.safetensors), resolved from "
-                           "3_4_AuraFlow_VAE or ComfyUI/models/vae. All-in-one uses its bundled VAE by default. "
-                           "Required (SDXL-style VAE) for a transformer-only checkpoint (separate-loader path)"))
+                           "3_4_AuraFlow_VAE / etc / ComfyUI/models/vae. All-in-one uses its bundled VAE by default. "
+                           f"For transformer-only (separate-loader) it auto-uses {DEFAULT_SEPARATE_VAE} when omitted"))
     ap.add_argument("--clip", type=str, default=None,
                     help=L("transformer 単体 checkpoint 用の pile-T5 テキストエンコーダ名 "
-                           "(ComfyUI/models/text_encoders 配下)。分離ローダー経路で必須",
+                           "(ComfyUI/models/text_encoders / etc 配下)。"
+                           f"分離経路は未指定なら既定 {DEFAULT_SEPARATE_CLIP} を自動使用",
                            "pile-T5 text encoder name for a transformer-only checkpoint "
-                           "(under ComfyUI/models/text_encoders). Required for the separate-loader path"))
+                           "(under ComfyUI/models/text_encoders or etc). "
+                           f"Separate-loader auto-uses {DEFAULT_SEPARATE_CLIP} when omitted"))
     ap.add_argument("--clip-type", type=str, default="stable_diffusion",
                     help=L("CLIPLoader の type (既定 stable_diffusion)。pile-T5 は weights から "
                            "AuraT5 と自動判別されるため通常変更不要",
@@ -1910,12 +1880,10 @@ def main() -> None:
     checkpoint_data = load_checkpoint_toml()
     pick_state: dict = {}
 
-    # LoRA 資産を起動時 1 回準備 (AuraFlow 単一レーン)
-    lora_keywords_data = load_lora_keywords_toml()
+    # LoRA 資産を起動時 1 回準備 (AuraFlow 単一レーン、ランダム抽選)
     auraflow_lora_subjects = load_auraflow_lora_subjects()  # {stem: subject}。pose は OpenPose 段で除外
 
     loras_all = sorted(LORA_DIR.glob("*.safetensors")) if args.lora_stack_max > 0 else []
-    lora_corpus = build_lora_corpus_for_playground(loras_all, lora_keywords_data) if loras_all else {}
     print(L(f"  [AuraFlow] LoRA 候補: {len(loras_all)} 件",
             f"  [AuraFlow] LoRA candidates: {len(loras_all)}"))
 
@@ -1968,8 +1936,8 @@ def main() -> None:
                                        f"--prompt {args.prompt} requires --png-sentence <PNG>"))
                 src_png = resolve_png_path(args.png_sentence)
 
-            positive, negative, lora_keywords, extras = get_prompt_for_iteration(
-                args.prompt, src_png, args.sentence, args.lora_keywords, pony=args.pony,
+            positive, negative, _kws_unused, extras = get_prompt_for_iteration(
+                args.prompt, src_png, args.sentence, None, pony=args.pony,
             )
             is_refine = bool(extras.get("refine"))  # 画質アップ (PNG を init に AuraFlow img2img、1枚)
 
@@ -1981,16 +1949,24 @@ def main() -> None:
             # ローダー判定: transformer 単体 (model のみ) なら分離経路 (UNETLoader+CLIPLoader+VAELoader)
             unet_only = checkpoint_is_unet_only(checkpoint_path)
             if unet_only:
-                # 分離経路は外部 pile-T5 + SDXL系 VAE が必須 (--clip / --vae)
-                eff_vae = vae_name or args.vae
-                if not args.clip or not eff_vae:
+                # 分離経路: 外部 pile-T5 + SDXL系 VAE。--clip/--vae 未指定なら既定
+                # (pile_t5xl_fp16 / sdxl_vae) を自動使用。どちらも無ければエラー。
+                eff_clip = resolve_separate_clip(args.clip)
+                eff_vae  = resolve_separate_vae(args.vae)
+                if not eff_clip or not eff_vae:
+                    missing = []
+                    if not eff_clip:
+                        missing.append(f"CLIP({args.clip or DEFAULT_SEPARATE_CLIP})")
+                    if not eff_vae:
+                        missing.append(f"VAE({args.vae or DEFAULT_SEPARATE_VAE})")
                     raise SystemExit(L(
-                        f"{checkpoint_path.name} は transformer 単体です。分離ローダーには "
-                        f"--clip <pile-T5> (ComfyUI/models/text_encoders) と --vae <SDXL系VAE> が必須です",
-                        f"{checkpoint_path.name} is a transformer-only checkpoint. The separate-loader path "
-                        f"requires --clip <pile-T5> (in ComfyUI/models/text_encoders) and --vae <SDXL-style VAE>"))
+                        f"{checkpoint_path.name} は transformer 単体ですが、分離ローダー用の "
+                        f"{' / '.join(missing)} が見つかりません。ファイルを配置するか --clip/--vae で指定してください",
+                        f"{checkpoint_path.name} is a transformer-only checkpoint but the separate-loader "
+                        f"{' / '.join(missing)} was not found. Place the file(s) or pass --clip/--vae"))
             else:
-                # VAE: --vae 明示時のみ外部 VAE を使用 (未指定は all-in-one 同梱 VAE)
+                # all-in-one: 内蔵 CLIP/VAE を優先。--vae 明示時のみ外部 VAE で上書き
+                eff_clip = None
                 eff_vae = vae_name
             seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
             many = bool(extras.get("many") or args.many)
@@ -2023,7 +1999,7 @@ def main() -> None:
             inference_bonus = int(entry.get("inference", 0))
             use_steps = max(1, steps + inference_bonus)
 
-            # LoRA: original モードは PNG 由来、それ以外は keyword 抽選
+            # LoRA: original モードは PNG 由来、それ以外は一様ランダム抽選
             picked_loras: list[tuple[Path, float]] = []
             if "loras" in extras:
                 for name, strength in extras["loras"]:
@@ -2038,8 +2014,8 @@ def main() -> None:
                             continue
                     picked_loras.append((cand, float(strength)))
             elif args.gear == "high" and loras_all and args.lora_stack_max > 0:
-                picked = pick_n_loras_by_keywords(
-                    loras_all, lora_keywords, lora_corpus,
+                picked = pick_n_loras_random(
+                    loras_all,
                     n_max=args.lora_stack_max, n_min=args.lora_stack_min,
                 )
                 if picked:
@@ -2073,11 +2049,10 @@ def main() -> None:
 
             print(f"  path      : {pipeline_label}")
             print(f"  checkpoint: {checkpoint_path.name}"
-                  f"{' [unet-only: ' + (args.clip or '?') + ' + ' + str(eff_vae) + ']' if unet_only else ''}"
+                  f"{' [unet-only: ' + str(eff_clip) + ' + ' + str(eff_vae) + ']' if unet_only else ''}"
                   f"{L(' (未計測)', ' (unscored)') if checkpoint_path.stem not in checkpoint_data else ''}")
             print(f"  positive  : {positive[:120]}{'...' if len(positive) > 120 else ''}")
             print(f"  negative  : {negative[:80]}{'...' if len(negative) > 80 else ''}")
-            print(f"  lora_kw   : {', '.join(lora_keywords) if lora_keywords else '(none)'}")
             if picked_loras:
                 names = [f"{p.name}({s:.2f})" for p, s in picked_loras]
                 print(f"  LoRA x{len(picked_loras)}: " + " + ".join(names))
@@ -2105,7 +2080,6 @@ def main() -> None:
             # 全 augmentation を共通 helper に集約 (GUI と同じ経路、プロンプトの最終形が必ず一致)
             positive_augmented, negative_augmented, picked_loras, gate_logs = prepare_workflow_prompt(
                 positive, negative,
-                lora_keywords=lora_keywords,
                 picked_loras=picked_loras,
                 controlnet_mode=controlnet_mode,
                 auraflow_lora_subjects=auraflow_lora_subjects,
@@ -2140,7 +2114,7 @@ def main() -> None:
                 hires_denoise=args.hires_denoise, hires_steps=args.hires_steps,
                 vae_override=eff_vae,   # all-in-one: --vae 指定時のみ / 分離: 必須
                 unet_only=unet_only,
-                clip_name=(args.clip if unet_only else None),
+                clip_name=eff_clip,
                 clip_type=args.clip_type,
                 unet_dtype=args.unet_dtype,
             )
@@ -2195,7 +2169,6 @@ def main() -> None:
                 sampler=args.sampler, scheduler=args.scheduler,
                 width=final_w, height=final_h,
                 checkpoint=checkpoint_path.name,
-                lora_keywords=lora_keywords,
                 loras=[(p.name, s) for p, s in picked_loras],
                 controlnet_name=picked_controlnet.name if picked_controlnet else None,
                 controlnet_mode=controlnet_mode,
@@ -2228,7 +2201,6 @@ def main() -> None:
                         sampler=args.sampler, scheduler=args.scheduler,
                         width=final_w * 4, height=final_h * 4,
                         checkpoint=checkpoint_path.name,
-                        lora_keywords=lora_keywords,
                         loras=[(p.name, s) for p, s in picked_loras],
                         controlnet_name=picked_controlnet.name if picked_controlnet else None,
                         controlnet_mode=controlnet_mode,

@@ -33,14 +33,10 @@ except ImportError:
     ImageTk = None
 
 from common import (
-    _parse_keyword_clauses,
-    _text_matches_clauses,
-    build_lora_corpus,
     build_prompt,
-    load_lora_params,
     load_prompt_config,
     normalize_emphasis,
-    pick_n_loras_by_keywords,
+    pick_n_loras_random,
 )
 from pngutil import read_text_chunks, write_text_chunks
 
@@ -137,7 +133,6 @@ class GenerateGUI:
         self.loras: list[Path] = []
         self.controlnets: list[Path] = []
         self.current_loras: list[Path] = []
-        self._lora_params_cache: Optional[dict] = None  # LoRA_param.toml の遅延キャッシュ (kw ハイライト用)
         self.selected_lora_indices: set[int] = set()
         self.selected_controlnet_index: int = -1
 
@@ -213,27 +208,7 @@ class GenerateGUI:
         )
 
         row += 1
-        ttk.Label(top, text="LoRA キーワード:").grid(
-            row=row, column=0, sticky="ne", padx=4, pady=4,
-        )
-        lora_kw_frame = ttk.Frame(top)
-        lora_kw_frame.grid(row=row, column=1, sticky="ew", padx=4, pady=4)
-        lora_kw_frame.grid_columnconfigure(0, weight=1)
-        # キーワードを入れると手動選択が空のとき pick_n_loras_by_keywords で実行時抽選される
-        # (手動選択がある場合は通常通り manual 優先、kw は無視 → 動作が混乱しない)
-        self.lora_kw_var = tk.StringVar()
-        self.lora_kw_entry = ttk.Entry(lora_kw_frame, textvariable=self.lora_kw_var)
-        self.lora_kw_entry.grid(row=0, column=0, sticky="ew")
-        ttk.Label(
-            lora_kw_frame,
-            text="(カンマ区切り、手動選択が空のとき毎枚抽選。候補は LoRA 一覧で赤背景表示)",
-            foreground="#888",
-        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
-        # キーワード変更 → LoRA listbox の候補ハイライトを更新
-        self.lora_kw_var.trace_add("write", lambda *_: self._refresh_lora_candidate_highlight())
-
-        row += 1
-        ttk.Label(top, text="LoRA (Ctrl/Shiftクリックで複数選択):").grid(
+        ttk.Label(top, text="LoRA (Ctrl/Shiftクリックで複数選択 / 空欄なら毎枚ランダム抽選):").grid(
             row=row, column=0, sticky="ne", padx=4, pady=4,
         )
         lora_frame = ttk.Frame(top)
@@ -532,43 +507,10 @@ class GenerateGUI:
             self.lora_listbox.insert(tk.END, p.stem)
         self.selected_lora_indices.clear()
         self._refresh_lora_icons()
-        self._refresh_lora_candidate_highlight()
 
     def _on_lora_select(self, event=None) -> None:
         self.selected_lora_indices = set(self.lora_listbox.curselection())
         self._refresh_lora_icons()
-
-    def _refresh_lora_candidate_highlight(self) -> None:
-        """LoRA キーワード変更/版切替時に呼び出す。pick_lora_by_keywords でマッチしうる
-        LoRA を listbox で赤背景 (#ffcccc) に染め、それ以外は白に戻す。"""
-        if not hasattr(self, "lora_listbox"):
-            return
-        raw = self.lora_kw_var.get() or ""
-        keywords = [k.strip() for k in raw.split(",") if k.strip()]
-        n = self.lora_listbox.size()
-        if not keywords:
-            for i in range(n):
-                try:
-                    self.lora_listbox.itemconfig(i, background="white")
-                except Exception:
-                    pass
-            return
-        try:
-            if self._lora_params_cache is None:
-                self._lora_params_cache = load_lora_params()
-        except Exception:
-            self._lora_params_cache = {}
-        corpus = build_lora_corpus(self.current_loras, self._lora_params_cache or {})
-        clauses = _parse_keyword_clauses(keywords)
-        for i, lora in enumerate(self.current_loras):
-            if i >= n:
-                break
-            text = corpus.get(lora.stem) or lora.stem.lower()
-            bg = "#ffcccc" if _text_matches_clauses(text, clauses) else "white"
-            try:
-                self.lora_listbox.itemconfig(i, background=bg)
-            except Exception:
-                pass
 
     def _on_cn_select(self, event=None) -> None:
         sel = self.cn_listbox.curselection()
@@ -741,9 +683,6 @@ class GenerateGUI:
             seed_input = -1
 
         # LoRA キーワード (カンマ区切り→list[str])。手動選択が空 + ckpt 確定 のとき毎枚抽選に使う
-        lora_kw_raw = self.lora_kw_var.get() or ""
-        lora_keywords = [k.strip() for k in lora_kw_raw.split(",") if k.strip()]
-
         params = {
             "checkpoint": ckpt,
             "checkpoint_random": ckpt_random,
@@ -753,7 +692,6 @@ class GenerateGUI:
             "positive_extra": positive_extra,  # toml モードで追加前置するときに使う
             "negative": negative,
             "loras": loras_with_strength,
-            "lora_keywords": lora_keywords,
             "count": int(self.count_var.get()),
             "cfg": float(self.cfg_var.get()),
             "pony": bool(self.pony_var.get()),
@@ -808,7 +746,6 @@ class GenerateGUI:
             "prompt_mode":       str(self.prompt_mode_var.get()),
             "count":             int(self.count_var.get()),
             "checkpoint_random": bool(self.checkpoint_random_var.get()),
-            "lora_keywords":     self.lora_kw_var.get() or "",
             "many":              bool(self.many_var.get()),
             "positive":          self.positive_value,
             "negative":          self.negative_value,
@@ -884,11 +821,6 @@ class GenerateGUI:
         _try(self.many_var.set,              "many",              bool)
         # ランダムチェック復元後に combobox の disabled 状態を反映
         self._on_checkpoint_random_toggle()
-        if "lora_keywords" in data:
-            try:
-                self.lora_kw_var.set(str(data["lora_keywords"]))
-            except Exception:
-                pass
         _try(self.cfg_var.set,          "cfg",           float)
         _try(self.pony_var.set,         "pony",          bool)
         _try(self.steps_var.set,        "steps",         int)
@@ -1080,7 +1012,6 @@ class GenerateGUI:
         seed_input = int(params["seed"])
         hires_scale = float(params["hires_scale"])
         ckpt_random = bool(params.get("checkpoint_random"))
-        lora_keywords: list[str] = list(params.get("lora_keywords") or [])
         manual_loras = params["loras"] or []
         lora_total = float(self.lora_total_var.get())
         prompt_mode = params.get("prompt_mode", "free")
@@ -1095,14 +1026,7 @@ class GenerateGUI:
                 self._result_queue.put({"error": f"prompt.toml 読み込み失敗: {e}"})
                 return
 
-        # キーワード抽選で使う LoRA corpus は ckpt 確定後に組む必要があるが、
-        # LoRA_param.toml は 1 回だけ読めば良いので先にキャッシュ
-        try:
-            lora_params_cache = load_lora_params()
-        except Exception:
-            lora_params_cache = {}
-
-        # CLI と同じプロンプト augmentation (prepare_workflow_prompt): kw append / pose-gate
+        # CLI と同じ helper で pose-gate を集約 (LoRA はランダム選択、kw 抽選は廃止)
         try:
             checkpoint_data = load_checkpoint_toml()
         except Exception:
@@ -1147,7 +1071,7 @@ class GenerateGUI:
             # prompt.toml モード: 毎枚 build_prompt で抽選 (positive/negative/kw/many を上書き)
             # 自由記載モード: gather 時点で確定済の params["positive"] 等をそのまま使う
             if prompt_mode == "toml":
-                iter_pos, iter_neg, iter_kws, iter_many = build_prompt(prompt_cfg, pony=pony)
+                iter_pos, iter_neg, _iter_kws, iter_many = build_prompt(prompt_cfg, pony=pony)
                 if positive_extra:
                     iter_pos = f"{positive_extra}, {iter_pos}" if iter_pos else positive_extra
                 iter_pos = normalize_emphasis(iter_pos)
@@ -1155,7 +1079,6 @@ class GenerateGUI:
             else:
                 iter_pos = params["positive"]
                 iter_neg = params["negative"]
-                iter_kws = lora_keywords
                 iter_many = bool(params.get("many"))
 
             # チェックポイントが「ランダム」なら毎枚抽選 (AuraFlow 単一プール)
@@ -1167,17 +1090,14 @@ class GenerateGUI:
             this_pool = self.loras
             this_manual = manual_loras
 
-            # LoRA 決定:
+            # LoRA 決定 (キーワードマッチは廃止):
             #   ① 手動選択あり → そのまま
-            #   ② 手動選択なし & キーワードあり → pick_n_loras_by_keywords で 1-3 個抽選
-            #   ③ 手動選択なし & キーワードなし → LoRA 無し
+            #   ② 手動選択なし → プールから一様ランダムに 1-3 個抽選
+            #   ③ プールが空 → LoRA 無し
             if this_manual:
                 this_loras = this_manual
-            elif iter_kws:
-                corpus = build_lora_corpus(this_pool, lora_params_cache)
-                picked = pick_n_loras_by_keywords(
-                    this_pool, iter_kws, corpus, n_max=3, n_min=1,
-                )
+            elif this_pool:
+                picked = pick_n_loras_random(this_pool, n_max=3, n_min=1)
                 scale = lora_total / max(1, len(picked))
                 this_loras = [(p, scale) for p in picked]
             else:
@@ -1203,14 +1123,12 @@ class GenerateGUI:
             this_cn_image = ref_uploaded_name if this_cn_name else None
             effective_cn_mode = cn_mode if this_cn_name else ""
 
-            # CLI と同じ helper で augmentation 集約: kw append / pose-gate
+            # CLI と同じ helper で pose-gate を集約 (kw append は廃止)
             positive_aug, negative_aug, this_loras_filtered, gate_logs = prepare_workflow_prompt(
                 iter_pos, iter_neg,
-                lora_keywords=iter_kws,
                 picked_loras=this_loras,
                 controlnet_mode=effective_cn_mode,
                 auraflow_lora_subjects=auraflow_lora_subjects,
-                lora_total=lora_total,
             )
             for line in gate_logs:
                 print(line, flush=True)
@@ -1269,7 +1187,6 @@ class GenerateGUI:
                     steps=steps, cfg=cfg, sampler=sampler, scheduler=scheduler,
                     width=final_w, height=final_h,
                     checkpoint=this_ckpt.name,
-                    lora_keywords=iter_kws,
                     loras=workflow_loras or None,
                     adetailer=params["adetailer"],
                     pipeline="GUI",
