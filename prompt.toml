@@ -1,6 +1,19 @@
-# prompt.toml - AuraFlow/AulaFlow 向けプロンプト構成。
+# prompt.toml - AuraFlow/AulaFlow 向けプロンプト構成 (バイリンガル構成)。
 # build_prompt() が各セクションから抽選し、カンマで連結して prompt を作る。
-# Danbooru 風のタグ羅列ではなく、AuraFlow が解釈しやすい自然な英語の句を中心にする。
+#
+# 【言語方針】
+#   情景描写 (who / wearing / with_items / motion / at / lighting / expression) は日本語で書く。
+#   生成時は `--translate` (Gemma via Ollama) が描写部をまとめて自然な英語に翻訳する。
+#   → 日本語 toml は **`--translate` 常時 ON が前提**。OFF / Ollama 未起動だと日英混在のまま
+#     pile-T5 に渡り品質が落ちる (フォールバックで原文=日本語が出る) ので注意。
+#   品質アンカー (positive_always) / negative_always / pony_prefix は **英語のまま固定**:
+#     - positive_always: 「five fingers」「35mm」等は翻訳で消えやすい要。verbatim 保護対象。
+#     - negative_always: pile-T5 向け＆ negative は整形対象外 (触らない設計)。
+#     - pony_prefix: `score_9` 等はリテラルなトークン。翻訳しない。
+#
+# 【センチネル】"nothing" はコード上の特別値なので **英語のまま残す**:
+#     - wearing  の "nothing" → "naked" 扱い
+#     - with_items の "nothing" → その項目を無視
 #
 # who         : [description, weight, has_wearing, has_motion, has_where, many, lora_keywords]
 # wearing     : [clothing, weight, lora_keywords]
@@ -12,45 +25,46 @@
 # many=true は複数人物向けの横長キャンバス指定に使われる。
 
 who = [
-    # neutral portraits and poses
-    ["**An adult woman poses calmly for a full-body photographic scene.**", 20, false, false, false, false, ""],
-    ["**Two adult women pose together in a balanced full-body composition.**", 12, false, false, false, true, ""],
+    # ニュートラルなポートレート / ポーズ
+    ["**大人の女性が落ち着いた様子で全身写真のポーズをとっている**", 20, false, false, false, false, ""],
+    ["**二人の大人の女性がバランスのとれた全身構図で一緒にポーズをとっている**", 12, false, false, false, true, ""],
 ]
 
-# 生成側で "nothing" は naked として扱われ、それ以外は "wearing {clothing}" になる。
+# 生成側で "nothing" は naked として扱われ (英語のまま残す)、それ以外は "wearing {clothing}" になる。
 wearing = [
-    ["a dress", 22, "dress"],
+    ["ドレス", 22, "dress"],
 ]
 
-# 生成側で "nothing" は無視され、それ以外は "with {item}" になる。
+# 生成側で "nothing" は無視され (英語のまま残す)、それ以外は "with {item}" になる。
 with_items = [
     ["nothing", 70, ""],
 ]
 
 motion = [
-    ["standing with relaxed posture", 45, ""],
-    ["squatting with balanced posture", 35, "squat"],
-    ["sitting with the full body visible", 35, ""],
-    ["leaning forward naturally", 30, ""],
-    ["standing while turning her back toward the camera", 16, ""],
-    ["sitting while turning her back toward the camera", 14, ""],
-    ["lying down with the whole body in frame", 18, ""],
+    ["リラックスした姿勢で立っている", 45, ""],
+    ["バランスのとれた姿勢でしゃがんでいる", 35, "squat"],
+    ["全身が見えるように座っている", 35, ""],
+    ["自然に前かがみになっている", 30, ""],
+    ["カメラに背を向けて立っている", 16, ""],
+    ["カメラに背を向けて座っている", 14, ""],
+    ["全身が画面に収まるように横たわっている", 18, ""],
 ]
 
 at = [
-    ["a quiet room", 30, ""],
-    ["a beach", 5, ""],
-    ["a couch", 10, ""],
-    ["a bed in a private room", 10, ""],
-    ["a hotel bed", 10, ""],
-    ["a modern bathroom", 6, ""],
+    ["静かな部屋", 30, ""],
+    ["ビーチ", 5, ""],
+    ["ソファ", 10, ""],
+    ["個室のベッド", 10, ""],
+    ["ホテルのベッド", 10, ""],
+    ["モダンなバスルーム", 6, ""],
 ]
 
 lighting = [
-    "soft white lighting with natural shadows",
-    "colored cinematic lighting with realistic skin tones",
+    "自然な陰影のある柔らかい白色光",
+    "リアルな肌色を引き出す色付きのシネマティック照明",
 ]
 
+# 以下は英語固定 (翻訳・整形しない)。
 positive_always = "A photorealistic full-body 35mm photograph, head to toe in frame, the subject standing far enough from the camera to show the whole body, natural body proportions, anatomically correct body, realistic detailed skin with visible pores, natural color, sharp focus, detailed face, clear symmetric eyes, detailed hands with five fingers, natural hand pose, large breasts, coherent perspective, realistic lighting."
 
 # Pony V7 モード (--pony / GUI Pony トグル) のときだけ positive 先頭に付加される quality/score タグ。

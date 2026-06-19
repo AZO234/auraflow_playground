@@ -22,7 +22,14 @@ tomli-w
 huggingface-hub
 
 # ComfyUI HTTP API への multipart POST 画像アップロード (generate.py)
+# + Gemma 翻訳/整形の Ollama HTTP 呼び出し (--translate, common.refine_prompt_text)
 requests
+
+# --translate (日本語→英語プロンプト翻訳 / 合成英語の自然文化) は Ollama を外部サービスとして
+# 利用する (pip 依存ではない)。別途インストールして Gemma を pull しておく:
+#   Ollama 本体 : https://ollama.com/download
+#   モデル取得  : ollama pull gemma3:4b   (8GB VRAM 向け既定。--ollama-model で変更可)
+# Ollama 未起動・モデル未取得でも生成は動く (翻訳をスキップして原文プロンプトを使用)。
 
 # ComfyUI HTTP API への WebSocket 進捗ストリーミング (generate.py)
 websocket-client

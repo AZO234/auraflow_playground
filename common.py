@@ -27,7 +27,7 @@ import random
 import re
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 try:
     import tomllib  # Python 3.11+
@@ -73,6 +73,111 @@ def normalize_emphasis(text: str) -> str:
     return EMPHASIS_RE.sub(_repl, text)
 
 
+# --------------------------------------------------------------------------- #
+# Gemma (Ollama) でプロンプトを日本語→英語に翻訳 / 合成英語を自然文化
+# --------------------------------------------------------------------------- #
+# AuraFlow の text encoder は pile-T5 でほぼ英語前提。日本語の --sentence や
+# prompt.toml のブツ切り英語を、Gemma で自然な英語プロンプトに整える。
+# Ollama (http://localhost:11434) を HTTP で叩くだけ (requests は既存依存)。
+OLLAMA_DEFAULT_HOST = "http://localhost:11434"
+OLLAMA_DEFAULT_MODEL = "gemma3:4b"  # 8GB VRAM で生成と同居できる現実的な既定
+
+# LLM が付けがちな前置き ("Here is the translation:" 等) を除去する。
+_LLM_PREFACE_RE = re.compile(
+    r"^\s*(?:here(?:'s| is)|sure|certainly|translation|english(?: prompt)?|prompt|output|result)\b[^\n:：]*[:：]\s*",
+    re.IGNORECASE,
+)
+
+
+def _clean_llm_line(text: str) -> str:
+    """LLM 応答からコードフェンス・前置き・囲みクォートを除去し、1 行に畳む。"""
+    t = (text or "").strip()
+    # ```...``` コードフェンス除去
+    if t.startswith("```"):
+        t = re.sub(r"^```[^\n]*\n?", "", t)
+        t = re.sub(r"\n?```\s*$", "", t).strip()
+    # 先頭の前置きを 1 度だけ除去
+    t = _LLM_PREFACE_RE.sub("", t, count=1)
+    # 改行を空白に畳む
+    t = re.sub(r"\s*\n+\s*", " ", t).strip()
+    # 全体を囲むクォートを剥がす
+    if len(t) >= 2 and t[0] in "\"'“”「『" and t[-1] in "\"'“”」』":
+        t = t[1:-1].strip()
+    return t
+
+
+def _ollama_generate(prompt: str, *, model: str, host: str, timeout: float) -> Optional[str]:
+    """Ollama /api/generate を同期で叩いて応答テキストを返す。失敗時 None。"""
+    import requests  # 既存依存 (ComfyUI アップロードでも使用)
+    url = host.rstrip("/") + "/api/generate"
+    try:
+        r = requests.post(
+            url,
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.3},
+            },
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        return str(r.json().get("response") or "").strip()
+    except Exception as e:  # 接続不可・モデル無し等は致命にせず原文フォールバック
+        print(L(f"  [warn] Ollama 呼び出し失敗 ({e}); 原文を使用",
+                f"  [warn] Ollama call failed ({e}); using original text"))
+        return None
+
+
+def refine_prompt_text(
+    text: str,
+    *,
+    naturalize: bool = False,
+    model: str = OLLAMA_DEFAULT_MODEL,
+    host: str = OLLAMA_DEFAULT_HOST,
+    timeout: float = 60.0,
+) -> str:
+    """Gemma (Ollama) でプロンプト文を整える。失敗時は原文をそのまま返す。
+
+    naturalize=False : 日本語 → 自然な英語プロンプト (翻訳)。
+    naturalize=True  : カンマ区切りのブツ切り英語 → 1 本の自然な英文 (整形)。
+
+    どちらも `**強調**` 記法は保持させ、score タグ・LoRA 名・カメラ語・コメントは
+    足させない (品質アンカーや Pony prefix は呼び出し側が別途 verbatim 付加する)。
+    """
+    text = (text or "").strip()
+    if not text:
+        return text
+    if naturalize:
+        instr = (
+            "You are a prompt editor for a text-to-image model. "
+            "The following comma-separated fragments may be in Japanese, English, or a mix. "
+            "Translate any non-English part into English, then rewrite everything into ONE "
+            "fluent, natural English sentence describing the scene. "
+            "Preserve every `**...**` emphasis marker exactly as written "
+            "(translate the text inside the markers but keep the `**` around it). "
+            "Do not add, drop, or change any concrete detail. "
+            "Do not add quality tags, score tags, camera specs, LoRA names, or any commentary. "
+            "Output only the rewritten prompt on a single line.\n\n"
+            f"Fragments: {text}"
+        )
+    else:
+        instr = (
+            "You are a prompt translator for a text-to-image model. "
+            "Translate the following Japanese image description into ONE natural English "
+            "sentence suitable as a text-to-image prompt. "
+            "Preserve every `**...**` emphasis marker exactly as written. "
+            "Do not add quality tags, score tags, LoRA names, or any commentary. "
+            "Output only the English prompt on a single line.\n\n"
+            f"Japanese: {text}"
+        )
+    out = _ollama_generate(instr, model=model, host=host, timeout=timeout)
+    if not out:
+        return text
+    cleaned = _clean_llm_line(out)
+    return cleaned or text
+
+
 def load_prompt_config() -> dict:
     """prompt.toml をロード。存在しなければ最小デフォルトを返す。"""
     if not PROMPT_TOML.exists():
@@ -113,7 +218,11 @@ def _entry_keyword(entry: list | None) -> str:
     return ""
 
 
-def build_prompt(cfg: dict, pony: bool = False) -> tuple[str, str, list[str], bool]:
+def build_prompt(
+    cfg: dict,
+    pony: bool = False,
+    naturalize: Optional[Callable[[str], str]] = None,
+) -> tuple[str, str, list[str], bool]:
     """prompt.toml の設定から (positive, negative, lora_keywords, many) を組み立てる。
 
     many は採用された who エントリが複数人 (例 "2 women") を表すフラグ。
@@ -286,10 +395,22 @@ def build_prompt(cfg: dict, pony: bool = False) -> tuple[str, str, list[str], bo
     if expression_list:
         parts.append(str(random.choice(expression_list)))
 
-    # 必ず付加 (positive)
+    # ここまでが動的記述部 (who/wearing/with_items/motion/at/lighting/expression)。
+    # naturalize 指定時は Gemma 等でこのブツ切り英語を 1 本の自然英文へ整形する。
+    # positive_always (品質アンカー) と pony_prefix は整形対象外で verbatim 連結し、
+    # 言い換えで「five fingers」「35mm」等の要が消えるのを防ぐ。
+    dynamic = ", ".join(parts)
+    if naturalize and dynamic:
+        dynamic = naturalize(dynamic)
+
+    out_parts: list[str] = []
+    if dynamic:
+        out_parts.append(dynamic)
+
+    # 必ず付加 (positive) — 品質アンカーなので naturalize させず verbatim。
     pos_always = str(cfg.get("positive_always") or "").strip()
     if pos_always:
-        parts.append(pos_always)
+        out_parts.append(pos_always)
 
     neg_always = str(cfg.get("negative_always") or "").strip()
 
@@ -297,7 +418,7 @@ def build_prompt(cfg: dict, pony: bool = False) -> tuple[str, str, list[str], bo
     if pony:
         pony_prefix = str(cfg.get("pony_prefix") or "").strip()
         if pony_prefix:
-            parts.insert(0, pony_prefix)
+            out_parts.insert(0, pony_prefix)
 
     # LoRA キーワード機構は廃止 (AuraFlow/Pony はキャラ人相 LoRA が主流で、
     # 小物・効果のキーワードマッチング前提が成立しないため)。LoRA はランダム選択に統一。
@@ -306,7 +427,7 @@ def build_prompt(cfg: dict, pony: bool = False) -> tuple[str, str, list[str], bo
     _ = lora_keywords  # 収集はするが破棄 (toml 旧フォーマット互換のためパースは残す)
 
     return (
-        normalize_emphasis(", ".join(parts)),
+        normalize_emphasis(", ".join(out_parts)),
         normalize_emphasis(neg_always),
         [],
         many,

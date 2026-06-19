@@ -37,6 +37,9 @@ from common import (
     load_prompt_config,
     normalize_emphasis,
     pick_n_loras_random,
+    refine_prompt_text,
+    OLLAMA_DEFAULT_MODEL,
+    OLLAMA_DEFAULT_HOST,
 )
 from pngutil import read_text_chunks, write_text_chunks
 
@@ -365,6 +368,8 @@ class GenerateGUI:
         # 関連 Var は __init__ で生成しておき、ダイアログ widget が textvariable で直接束縛する
         self.cfg_var = tk.DoubleVar(value=3.5)          # AuraFlow は通常 CFG (negative 実効)
         self.pony_var = tk.BooleanVar(value=False)      # Pony V7 モード (euler_cfg_pp/cfg1.5/clip skip-2/score タグ)
+        # 翻訳/整形 (Gemma via Ollama)。ON で日本語プロンプト/日本語 prompt.toml を自然な英語に。
+        self.translate_var = tk.BooleanVar(value=False)
         # ADetailer は AuraFlow では基本不要 (顔/手は高精細にネイティブ生成、8GB では最重) → 既定 OFF。
         # 手/顔/身体の良好さは prompt 側で肯定文指定 (prompt.toml positive_always)。
         self.adetailer_var = tk.BooleanVar(value=False)
@@ -695,6 +700,7 @@ class GenerateGUI:
             "count": int(self.count_var.get()),
             "cfg": float(self.cfg_var.get()),
             "pony": bool(self.pony_var.get()),
+            "translate": bool(self.translate_var.get()),
             "adetailer": bool(self.adetailer_var.get()),
             "adetailer_person": bool(self.adetailer_person_var.get()),
             "hires_fix": bool(self.hires_var.get()),
@@ -752,6 +758,7 @@ class GenerateGUI:
             # 生成パラメータ
             "cfg":            float(self.cfg_var.get()),
             "pony":           bool(self.pony_var.get()),
+            "translate":      bool(self.translate_var.get()),
             "steps":          int(self.steps_var.get()),
             "seed":           str(self.seed_var.get()),
             "width":          int(self.width_var.get()),
@@ -823,6 +830,7 @@ class GenerateGUI:
         self._on_checkpoint_random_toggle()
         _try(self.cfg_var.set,          "cfg",           float)
         _try(self.pony_var.set,         "pony",          bool)
+        _try(self.translate_var.set,    "translate",     bool)
         _try(self.steps_var.set,        "steps",         int)
         _try(self.seed_var.set,         "seed",          str)
         _try(self.width_var.set,        "width",         int)
@@ -920,6 +928,12 @@ class GenerateGUI:
         ttk.Label(gen_frame, text="(n 個で割って各 LoRA に配分)", foreground="#888").grid(
             row=3, column=2, columnspan=5, sticky="w", padx=(2, 4))
 
+        ttk.Checkbutton(gen_frame, text="翻訳/整形 (Gemma/Ollama, 日本語→自然な英語)",
+                        variable=self.translate_var).grid(
+            row=4, column=0, columnspan=4, sticky="w", padx=(4, 2), pady=2)
+        ttk.Label(gen_frame, text="Ollama 未起動時は原文使用", foreground="#888").grid(
+            row=4, column=4, columnspan=2, sticky="w", padx=(2, 4))
+
         # ---- 品質補正 ----
         boost_frame = ttk.LabelFrame(win, text="品質補正", padding=6)
         boost_frame.grid(row=3, column=0, columnspan=6, sticky="ew", **pad)
@@ -1008,6 +1022,7 @@ class GenerateGUI:
         scheduler = params["scheduler"]
         cfg = float(params["cfg"])
         pony = bool(params.get("pony", False))
+        translate = bool(params.get("translate", False))
         count = int(params["count"])
         seed_input = int(params["seed"])
         hires_scale = float(params["hires_scale"])
@@ -1071,13 +1086,18 @@ class GenerateGUI:
             # prompt.toml モード: 毎枚 build_prompt で抽選 (positive/negative/kw/many を上書き)
             # 自由記載モード: gather 時点で確定済の params["positive"] 等をそのまま使う
             if prompt_mode == "toml":
-                iter_pos, iter_neg, _iter_kws, iter_many = build_prompt(prompt_cfg, pony=pony)
+                # translate ON: 描写部だけ Gemma で自然な英語に整形 (アンカー/negative/pony は保護)
+                nat = (lambda s: refine_prompt_text(s, naturalize=True)) if translate else None
+                iter_pos, iter_neg, _iter_kws, iter_many = build_prompt(prompt_cfg, pony=pony, naturalize=nat)
                 if positive_extra:
                     iter_pos = f"{positive_extra}, {iter_pos}" if iter_pos else positive_extra
                 iter_pos = normalize_emphasis(iter_pos)
                 iter_neg = normalize_emphasis(iter_neg)
             else:
+                # 自由記載モード: translate ON なら日本語入力を自然な英語に翻訳
                 iter_pos = params["positive"]
+                if translate and iter_pos:
+                    iter_pos = normalize_emphasis(refine_prompt_text(iter_pos, naturalize=False))
                 iter_neg = params["negative"]
                 iter_many = bool(params.get("many"))
 

@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Optional
 
 from i18n import L
+from common import refine_prompt_text, OLLAMA_DEFAULT_MODEL, OLLAMA_DEFAULT_HOST
 # generate.py の既存機構を流用 (import 時に torch/ComfyUI 定数が読まれる)
 from generate import (
     ROOT,
@@ -382,7 +383,9 @@ def render_multi(*, checkpoint_name: str, loras, positive: str, negative: str, v
 
 def build_job(kind: str, path: Path, *, lora_templates: dict, ckpt_templates: dict,
               cats_by_ver: dict, prompts_by_ver: dict,
-              bases: dict, prompt: str, extra: str = "", lora_strength: float = 0.8):
+              bases: dict, prompt: str, extra: str = "", lora_strength: float = 0.8,
+              translate: bool = False, ollama_model: Optional[str] = None,
+              ollama_host: Optional[str] = None):
     """1 ターゲットの生成内容を組む。
 
     戻り値: (positive, checkpoint_name, loras, version, plan)。
@@ -422,6 +425,13 @@ def build_job(kind: str, path: Path, *, lora_templates: dict, ckpt_templates: di
         ckpt_name, loras = base.name, [(path.name, lora_strength)]
     if extra:
         positive = f"{positive}, {extra}"
+    if translate:
+        # scaffold / custom prompt / extra が日本語でも自然な英語にまとめる (Gemma via Ollama)。
+        # trigger トークンは概念詳細として保持されるが、未起動時は原文フォールバック。
+        positive = refine_prompt_text(
+            positive, naturalize=True,
+            model=ollama_model or OLLAMA_DEFAULT_MODEL,
+            host=ollama_host or OLLAMA_DEFAULT_HOST)
     return positive, ckpt_name, loras, version, plan
 
 
@@ -429,7 +439,8 @@ def regenerate(path: Path, *, seed: Optional[int] = None, steps: int = 20, cfg: 
                lora_strength: float = 0.8, sampler: str = "euler",
                scheduler: str = "sgm_uniform", extra: str = "", pony: bool = False,
                categories_file: Path = CATEGORIES_FILE,
-               client_id: Optional[str] = None) -> Path:
+               client_id: Optional[str] = None, translate: bool = False,
+               ollama_model: Optional[str] = None, ollama_host: Optional[str] = None) -> Path:
     """checkpoint / LoRA 1 つのプレビューを現在の LoRA_preview.toml 設定で焼き直し、
     サイドカー <name>.preview.png に保存してそのパスを返す。
     呼び出し側 (main()) で ComfyUI 起動済み前提。直接 import して使う場合は事前に
@@ -447,7 +458,8 @@ def regenerate(path: Path, *, seed: Optional[int] = None, steps: int = 20, cfg: 
     bases = build_family_bases({})
     job = build_job(kind, path, lora_templates=lora_templates, ckpt_templates=ckpt_templates,
                     cats_by_ver=cats_by_ver, prompts_by_ver=prompts_by_ver,
-                    bases=bases, prompt=DEFAULT_POSITIVE, extra=extra, lora_strength=lora_strength)
+                    bases=bases, prompt=DEFAULT_POSITIVE, extra=extra, lora_strength=lora_strength,
+                    translate=translate, ollama_model=ollama_model, ollama_host=ollama_host)
     if job is None:
         raise RuntimeError(f"no matching base for {path.stem}")
     positive, ckpt_name, loras, version, _plan = job
@@ -507,6 +519,17 @@ def main() -> None:
     ap.add_argument("--pony", action="store_true",
                     help=L("Pony V7 推奨でプレビュー (euler_cfg_pp/cfg1.5/clip skip-2/score タグ)",
                            "preview with Pony V7 settings (euler_cfg_pp/cfg1.5/clip skip-2/score tags)"))
+    ap.add_argument("--translate", action="store_true",
+                    help=L("プレビュー positive を Gemma (Ollama) で自然な英語に整形/翻訳。"
+                           "日本語 scaffold / カスタムプロンプトを使う時に。Ollama 未起動時は原文使用",
+                           "Refine the preview positive into natural English via Gemma (Ollama). "
+                           "Use when scaffolds / custom prompts are Japanese. Falls back to original if Ollama is down"))
+    ap.add_argument("--ollama-model", type=str, default=None,
+                    help=L(f"--translate に使う Ollama モデル (既定 {OLLAMA_DEFAULT_MODEL})",
+                           f"Ollama model for --translate (default {OLLAMA_DEFAULT_MODEL})"))
+    ap.add_argument("--ollama-host", type=str, default=None,
+                    help=L(f"Ollama ホスト URL (既定 {OLLAMA_DEFAULT_HOST})",
+                           f"Ollama host URL (default {OLLAMA_DEFAULT_HOST})"))
     ap.add_argument("--lora-strength", type=float, default=0.8)
     ap.add_argument("--sampler", type=str, default=None,
                     help=L("sampler (未指定: base=euler / --pony=euler_cfg_pp)",
@@ -602,7 +625,9 @@ def main() -> None:
         job = build_job(kind, path, lora_templates=lora_templates, ckpt_templates=ckpt_templates,
                         cats_by_ver=cats_by_ver, prompts_by_ver=prompts_by_ver,
                         bases=bases, prompt=args.prompt,
-                        extra=args.extra, lora_strength=args.lora_strength)
+                        extra=args.extra, lora_strength=args.lora_strength,
+                        translate=args.translate, ollama_model=args.ollama_model,
+                        ollama_host=args.ollama_host)
         if job is None:
             print(L(f"  [warn] {path.stem}: 適合ベースなし、スキップ",
                     f"  [warn] {path.stem}: no matching base, skipped"), flush=True)

@@ -218,7 +218,7 @@ python generate.py
 python generate.py --pony          # Pony V7 defaults
 ```
 
-Generates images continuously. The `dist_tensors` triage runs first. Output goes to `3_8_AuraFlow_generated`・`3_9_AuraFlow_upscaled` as `YYYYMMDDHHMMSS.png`. A (device temp − 50) second cooldown runs between images. `Ctrl+C` to stop.
+Generates images continuously. The `dist_tensors` triage runs first. Output goes to `3_8_AuraFlow_generated`・`3_9_AuraFlow_upscaled` as `YYYYMMDDHHMMSS.png`. Default is continuous run with no cooldown (rely on the GPU's thermal throttling — minimizes heat/cool thermal cycling, kinder to hardware lifespan). Use `--cooldown <sec>` to set an explicit per-image wait. `Ctrl+C` to stop.
 
 #### Prompt (input source)
 

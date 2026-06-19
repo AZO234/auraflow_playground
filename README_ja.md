@@ -217,7 +217,7 @@ python generate.py
 python generate.py --pony          # Pony V7 の既定値
 ```
 
-画像を連続生成する。生成前に `dist_tensors` の振り分けが走る。出力は `3_8_AuraFlow_generated`・`3_9_AuraFlow_upscaled` に `YYYYMMDDHHMMSS.png`。1 枚ごとに（デバイス温度−50）秒の冷却。`Ctrl+C` で終了。
+画像を連続生成する。生成前に `dist_tensors` の振り分けが走る。出力は `3_8_AuraFlow_generated`・`3_9_AuraFlow_upscaled` に `YYYYMMDDHHMMSS.png`。既定は cooldown なしの連続運転（GPU のサーマルスロットリング任せ＝加熱／冷却の熱サイクルを抑え寿命に優しい）。`--cooldown <秒>` で枚ごとの待機を明示指定可。`Ctrl+C` で終了。
 
 #### プロンプト（入力ソース）
 

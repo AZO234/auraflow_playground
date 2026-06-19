@@ -53,7 +53,9 @@ from common import (
     build_prompt,
     load_prompt_config,
     pick_n_loras_random,
-    current_gpu_temp,
+    refine_prompt_text,
+    OLLAMA_DEFAULT_MODEL,
+    OLLAMA_DEFAULT_HOST,
     L,
 )
 # A1111 メタ書き込みは pngutil の serializer を流用
@@ -1463,6 +1465,9 @@ def get_prompt_for_iteration(
     sentence: Optional[str] = None,
     lora_keywords_arg: Optional[str] = None,
     pony: bool = False,
+    translate: bool = False,
+    ollama_model: Optional[str] = None,
+    ollama_host: Optional[str] = None,
 ) -> tuple[str, str, list[str], dict]:
     """指定 mode で 1 source 分の (positive, negative, lora_keywords, extras) を返す。
 
@@ -1476,9 +1481,16 @@ def get_prompt_for_iteration(
     from common import normalize_emphasis
     extras: dict = {}
 
+    # --translate 用の Gemma 整形コールバック (Ollama)。未指定なら None。
+    eff_model = ollama_model or OLLAMA_DEFAULT_MODEL
+    eff_host = ollama_host or OLLAMA_DEFAULT_HOST
+
     if mode == "auto":
         cfg = load_prompt_config()
-        pos, neg, kws, many = build_prompt(cfg, pony=pony)
+        nat = None
+        if translate:
+            nat = lambda s: refine_prompt_text(s, naturalize=True, model=eff_model, host=eff_host)
+        pos, neg, kws, many = build_prompt(cfg, pony=pony, naturalize=nat)
         extras["many"] = many
         return pos, neg, kws, extras
 
@@ -1486,6 +1498,9 @@ def get_prompt_for_iteration(
         if not sentence:
             raise SystemExit(L("--prompt sentence には --sentence \"...\" が必要", "--prompt sentence requires --sentence \"...\""))
         cfg = load_prompt_config()
+        if translate:
+            # 日本語の文章を自然な英語プロンプトに翻訳 (`**強調**` は保持)。
+            sentence = refine_prompt_text(sentence, naturalize=False, model=eff_model, host=eff_host)
         positive = normalize_emphasis(sentence)
         # Pony V7 モード: prompt.toml の pony_prefix (score タグ等) を先頭に付加
         if pony:
@@ -1631,6 +1646,19 @@ def main() -> None:
     ap.add_argument("--sentence", type=str, default=None,
                     help=L("--prompt sentence のとき、文章プロンプト。`**word**` 強調記法 OK",
                            "sentence prompt for --prompt sentence. `**word**` emphasis syntax supported"))
+    ap.add_argument("--translate", action="store_true",
+                    help=L("Gemma (Ollama) でプロンプトを整える。sentence モード=日本語を自然な英語に翻訳 / "
+                           "auto モード=prompt.toml の合成英語を 1 本の自然英文に整形。"
+                           "positive_always・negative・pony prefix・`**強調**` は保護。Ollama 未起動時は原文使用",
+                           "Refine the prompt via Gemma (Ollama). sentence mode = translate Japanese to natural English / "
+                           "auto mode = fuse prompt.toml fragments into one natural English sentence. "
+                           "positive_always / negative / pony prefix / `**emphasis**` are protected. Falls back to original if Ollama is down"))
+    ap.add_argument("--ollama-model", type=str, default=None,
+                    help=L(f"--translate に使う Ollama モデル (既定 {OLLAMA_DEFAULT_MODEL})",
+                           f"Ollama model for --translate (default {OLLAMA_DEFAULT_MODEL})"))
+    ap.add_argument("--ollama-host", type=str, default=None,
+                    help=L(f"Ollama ホスト URL (既定 {OLLAMA_DEFAULT_HOST})",
+                           f"Ollama host URL (default {OLLAMA_DEFAULT_HOST})"))
     ap.add_argument("--png", type=str, default=None,
                     help=L("画質アップ refine 用 PNG (1_0_prompts/ 配下 or 絶対パス)。"
                            "その画像を AuraFlow img2img で描き直す (1 枚で終了)",
@@ -1789,8 +1817,8 @@ def main() -> None:
                     help=L("Hires Fix 2 段目 step 数 (既定 20)",
                            "Hires Fix 2nd-pass steps (default 20)"))
     ap.add_argument("--cooldown", type=float, default=None,
-                    help=L("1 枚生成後の待機秒。既定: GPU 温度 - 50 秒 (温度取れなければ 1.0 秒、--cooldown 0 で OFF)",
-                           "cooldown interval in seconds after each image. Default: GPU temp - 50s (1.0s if temp unavailable, --cooldown 0 to disable)"))
+                    help=L("1 枚生成後の待機秒。既定: 0 (連続運転=GPU のサーマルスロットリング任せ。熱サイクルを抑え寿命に優しい)",
+                           "cooldown interval in seconds after each image. Default: 0 (continuous run, rely on GPU thermal throttling — minimizes thermal cycling)"))
     ap.add_argument("--dump-workflow", action="store_true",
                     help=L("投入する API workflow JSON を workflow_dump/ にも保存 (生成は通常通り実行)。"
                            "出力 JSON を ComfyUI WebUI の canvas にドラッグすればグラフを可視化できる",
@@ -1938,6 +1966,8 @@ def main() -> None:
 
             positive, negative, _kws_unused, extras = get_prompt_for_iteration(
                 args.prompt, src_png, args.sentence, None, pony=args.pony,
+                translate=args.translate, ollama_model=args.ollama_model,
+                ollama_host=args.ollama_host,
             )
             is_refine = bool(extras.get("refine"))  # 画質アップ (PNG を init に AuraFlow img2img、1枚)
 
@@ -2220,17 +2250,12 @@ def main() -> None:
             if args.gear == "high":
                 reload_update_save_checkpoint_toml(checkpoint_path.stem, elapsed, checkpoint_data)
 
-            # cooldown: --cooldown 明示なら固定、未指定なら (GPU 温度 - 50) 秒、取れなければ 1.0 秒
+            # cooldown: 既定は 0 (連続運転=GPU のサーマルスロットリング任せ)。
+            # 1 枚ごとに冷やすと加熱→冷却の熱サイクル(膨張収縮)が増えて寿命に悪い。
+            # 高温プラトーで連続運転し温度振幅を抑える方が良い。--cooldown 明示時のみ待機。
             if not stop["flag"]:
-                if args.cooldown is not None:
-                    wait_s = max(0.0, args.cooldown)
-                else:
-                    temp = current_gpu_temp()
-                    wait_s = max(0.0, float((temp or 51) - 50))
+                wait_s = max(0.0, args.cooldown) if args.cooldown is not None else 0.0
                 if wait_s > 0:
-                    if args.cooldown is None and temp is not None:
-                        print(L(f"  cooldown: GPU {temp}°C → {wait_s:.0f}s 待機",
-                                f"  cooldown: GPU {temp}°C → waiting {wait_s:.0f}s"))
                     time.sleep(wait_s)
 
         except Exception as e:
