@@ -99,6 +99,26 @@ python generate.py --pony --checkpoint <transformer単体> `
 
 > SDXL VAE は単一ファイルでそのまま使える。pile-T5-xl は HF 形式の enc-dec・3 シャードなので、`make_pile_t5_encoder.py` で encoder だけ抜き出して 1 ファイルに統合する（ComfyUI の `CLIPLoader` は単一ファイル・encoder 署名で `T5_XL` → AuraT5 と自動判定する）。
 
+### （任意）プロンプトの翻訳／整形 — Ollama + Gemma
+
+AuraFlow のテキストエンコーダ（pile-T5）は英語志向のため、日本語プロンプトは品質が落ちる。`--translate` フラグを付けると、ローカル LLM（[Ollama](https://ollama.com) 経由の Gemma）がプロンプトを自然な英語に翻訳する（日英混在も統一）。これにより `prompt.toml` / `--sentence` / GUI のプロンプトを日本語で書いても、モデルにはきれいな英語を渡せる。
+
+これは**任意機能**で、Ollama が無くても生成は動く。`--translate` 指定時に Ollama へ接続できない場合は警告を出して原文をそのまま使う（pip パッケージは追加しない。既存依存の `requests` を使う）。
+
+```powershell
+# 1) Ollama を導入（外部アプリ。pip パッケージではない）
+#    https://ollama.com/download
+# 2) モデルを pull — gemma3:4b（約 3.3GB Q4）が、8GB VRAM で
+#    AuraFlow 生成と同居できる現実的な既定。
+ollama pull gemma3:4b
+#    （gemma3:12b は重く、8GB では生成と同居は厳しい。）
+# 3) Ollama は http://localhost:11434 でローカルサーバを自動起動する。
+```
+
+あとは `generate.py` / `make_previews.py` に `--translate` を付けるか、GUI の「翻訳/整形 (Gemma/Ollama)」チェックボックスを ON にする。モデル/接続先は `--ollama-model` / `--ollama-host` で上書き可（既定 `gemma3:4b` / `http://localhost:11434`）。
+
+> 品質アンカー（`positive_always`）・`pony_prefix`・`negative_always`・`**強調**` マーカーは保護され、翻訳されるのは動的な描写部分のみ。
+
 ## ディレクトリ構成
 
 - `./` : スクリプト・設定ファイル
@@ -168,6 +188,8 @@ flowchart TD
 ## プロンプト設定ファイル prompt.toml
 
 プロンプトを生成するキーワードを記述する。重み記法あり：`*～*`（1.1倍）、`**～**`（1.3倍）、`***～***`（1.5倍）。
+
+> 同梱の `prompt.toml` はバイリンガル構成：描写セクション（who/wearing/motion/at/lighting）は**日本語**で書かれており、`--translate`（Ollama+Gemma）で自然な英語に変換して使う前提。品質アンカー（`positive_always` / `negative_always` / `pony_prefix`）と `"nothing"` センチネルは英語のまま。`--translate` を使わない場合、日本語はそのままモデルに渡る（品質低下）ので、翻訳を使わないなら各セクションを英語で書き直すこと。
 
 各セクションから抽選 → カンマ連結で 1 つの positive を組む。採用エントリの **LoRA キーワード**（後述）も集約される。
 
@@ -256,6 +278,7 @@ python generate.py --pony          # Pony V7 の既定値
 - `--hires-fix` / `--no-hires-fix` ・ `--upscale` / `--no-upscale` ： gear 連動の既定を上書き
 - `--lora-scale`（合計 0.8） / `--lora-stack-min`（3） / `--lora-stack-max`（5、0 で LoRA OFF）
 - `--arch cuda|cpu`（既定 cuda） / `--cooldown` / `--seed`
+- `--translate` ： Ollama+Gemma でプロンプトを自然な英語に翻訳／整形（任意。初期設定参照）。`--ollama-model`（既定 `gemma3:4b`）/ `--ollama-host`（既定 `http://localhost:11434`）。失敗時は原文を使用
 
 #### LoRA キーワード・抽選方式
 
@@ -286,6 +309,7 @@ python generate_gui.py
 - **チェックポイント**：`3_1_AuraFlow_checkpoint` を選択。サムネ（`<name>.preview.png`）を横に表示
 - **LoRA**：`3_2_AuraFlow_LoRA` を複数選択。**ControlNet**：`3_3_AuraFlow_ControlNet`（リファレンス画像 D&D 時に配線）
 - **設定ダイアログ**（`generate_gui.toml` に永続化）：CFG（既定 3.5）/ **Pony V7 チェックボックス** / Steps / Seed / 幅 / 高さ / Sampler（euler 既定）/ Scheduler（sgm_uniform 既定）/ LoRA 合計強度 / AD 補正（既定 OFF）/ Hires 各種
+- **翻訳/整形 チェックボックス**：Ollama+Gemma でプロンプトを自然な英語に翻訳／整形（任意。Ollama 未起動時は原文を使用）
 - **ギャラリー**：生成ごとにサムネ追加。クリックで原寸、右クリックで削除 / アップスケール
 - 出力は `3_8_AuraFlow_generated` / `3_9_AuraFlow_upscaled`
 
@@ -297,9 +321,10 @@ python make_previews.py --pony               # Pony V7 の既定値で生成
 python make_previews.py --only lora --limit 2
 python make_previews.py --dry-run            # 生成せず計画表示
 python make_previews.py --init-categories    # AuraFlow_categories を初期化
+python make_previews.py --translate          # Ollama+Gemma でプロンプトを翻訳／整形
 ```
 
-各テンソルの `<name>.preview.png` サイドカーを焼く。checkpoint はそのモデルで、LoRA は `3_1_AuraFlow_checkpoint` の代表ベース（`--base` で指定可）+ トリガー語で 1 枚。既定（cfg=3.5 / euler / sgm_uniform。`--pony` 時は Pony V7 既定）。
+各テンソルの `<name>.preview.png` サイドカーを焼く。checkpoint はそのモデルで、LoRA は `3_1_AuraFlow_checkpoint` の代表ベース（`--base` で指定可）+ トリガー語で 1 枚。既定（cfg=3.5 / euler / sgm_uniform。`--pony` 時は Pony V7 既定）。`--translate`（`--ollama-model` / `--ollama-host`）で Ollama+Gemma によるプロンプト英訳／整形が可能（任意。初期設定参照）。
 
 ### テンソル情報ビューア tensors_view.py
 

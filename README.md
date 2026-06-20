@@ -100,6 +100,26 @@ python generate.py --pony --checkpoint <transformer-only> \
 
 > The SDXL VAE is a single file usable as-is. pile-T5-xl ships as an HF enc-dec model in 3 shards, so `make_pile_t5_encoder.py` extracts just the encoder and merges it into one file (ComfyUI's `CLIPLoader` wants a single file and detects the encoder signature as `T5_XL` → AuraT5).
 
+### (optional) Prompt translation/refinement — Ollama + Gemma
+
+AuraFlow's text encoder (pile-T5) is English-oriented, so Japanese prompts degrade quality. With the `--translate` flag, prompts are translated into natural English (and mixed JA/EN is unified) by a local LLM via [Ollama](https://ollama.com). This lets you write `prompt.toml` / `--sentence` / GUI prompts in Japanese and still feed clean English to the model.
+
+This is **optional**: generation works without Ollama. When `--translate` is set but Ollama is unreachable, a warning is printed and the original prompt is used as-is (no pip package is added — it uses the already-required `requests`).
+
+```bash
+# 1) Install Ollama (external app; not a pip package)
+#    https://ollama.com/download
+# 2) Pull the model — gemma3:4b (~3.3GB Q4) is the realistic default
+#    that coexists with AuraFlow generation on 8GB VRAM.
+ollama pull gemma3:4b
+#    (gemma3:12b is heavier and generally too much alongside generation on 8GB.)
+# 3) Ollama runs a local server on http://localhost:11434 automatically.
+```
+
+Then add `--translate` to `generate.py` / `make_previews.py`, or tick the "翻訳/整形 (Gemma/Ollama)" checkbox in the GUI. Override the model/endpoint with `--ollama-model` / `--ollama-host` (defaults `gemma3:4b` / `http://localhost:11434`).
+
+> Quality anchors (`positive_always`), `pony_prefix`, `negative_always`, and `**emphasis**` markers are protected — only the dynamic descriptive part is translated.
+
 ## Directory Layout
 
 - `./` : scripts and config files
@@ -169,6 +189,8 @@ Key points:
 ## Prompt Config: prompt.toml
 
 Describes the keywords used to build prompts. Emphasis syntax: `*…*` (1.1x), `**…**` (1.3x), `***…***` (1.5x).
+
+> The shipped `prompt.toml` is bilingual: the descriptive sections (who/wearing/motion/at/lighting) are written in **Japanese** and are meant to be used with `--translate` (Ollama+Gemma) to become natural English. The quality anchors (`positive_always` / `negative_always` / `pony_prefix`) and the `"nothing"` sentinel stay in English. Without `--translate`, Japanese text is sent to the model as-is (lower quality) — rewrite the sections in English if you don't use translation.
 
 Each section is drawn and joined with commas into one positive. The **LoRA keywords** (below) of chosen entries are aggregated too.
 
@@ -257,6 +279,7 @@ Fix with `--checkpoint <name>`. The pool is the single `3_1_AuraFlow_checkpoint`
 - `--hires-fix` / `--no-hires-fix`, `--upscale` / `--no-upscale` : override the gear-linked defaults
 - `--lora-scale` (total 0.8) / `--lora-stack-min` (3) / `--lora-stack-max` (5, 0 disables LoRA)
 - `--arch cuda|cpu` (default cuda) / `--cooldown` / `--seed`
+- `--translate` : translate/refine the prompt into natural English via Ollama+Gemma (optional; see Setup). `--ollama-model` (default `gemma3:4b`) / `--ollama-host` (default `http://localhost:11434`). On failure the original prompt is used
 
 #### LoRA keywords / draw
 
@@ -287,6 +310,7 @@ A manual image-generation GUI (Tkinter). Generate 1–300 images in batches with
 - **Checkpoint**: select from `3_1_AuraFlow_checkpoint`. Thumbnails (`<name>.preview.png`) shown alongside
 - **LoRA**: multi-select from `3_2_AuraFlow_LoRA`. **ControlNet**: `3_3_AuraFlow_ControlNet` (wired when a reference image is dropped)
 - **Settings dialog** (persisted to `generate_gui.toml`): CFG (default 3.5) / **Pony V7 checkbox** / Steps / Seed / width / height / Sampler (euler default) / Scheduler (sgm_uniform default) / LoRA total strength / AD correction (OFF by default) / Hires options
+- **翻訳/整形 checkbox**: translate/refine the prompt into natural English via Ollama+Gemma (optional; original prompt is used when Ollama is not running)
 - **Gallery**: thumbnails added per image. Click for full size; right-click to delete / upscale
 - Output to `3_8_AuraFlow_generated` / `3_9_AuraFlow_upscaled`
 
@@ -298,9 +322,10 @@ python make_previews.py --pony               # render with Pony V7 defaults
 python make_previews.py --only lora --limit 2
 python make_previews.py --dry-run            # show plan without generating
 python make_previews.py --init-categories    # initialize AuraFlow_categories
+python make_previews.py --translate          # translate/refine prompts via Ollama+Gemma
 ```
 
-Renders `<name>.preview.png` sidecars per tensor. Checkpoints use themselves; LoRAs use a representative base from `3_1_AuraFlow_checkpoint` (specifiable via `--base`) + trigger words for one image. Defaults: cfg=3.5 / euler / sgm_uniform (or Pony V7 defaults with `--pony`).
+Renders `<name>.preview.png` sidecars per tensor. Checkpoints use themselves; LoRAs use a representative base from `3_1_AuraFlow_checkpoint` (specifiable via `--base`) + trigger words for one image. Defaults: cfg=3.5 / euler / sgm_uniform (or Pony V7 defaults with `--pony`). `--translate` (with `--ollama-model` / `--ollama-host`) refines prompts into English via Ollama+Gemma (optional; see Setup).
 
 ### Tensor Info Viewer: tensors_view.py
 
